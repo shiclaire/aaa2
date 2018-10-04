@@ -1,0 +1,75 @@
+- name: Restore Database
+  hosts: localhost
+  connection: local
+  become: yes
+  gather_facts: yes
+
+  vars:
+    private_ip: '{{private_ip}}'
+    time: '{{time}}'
+  tasks:
+    - name: Create a recovery directory
+      shell:  gzip -d /backup/mysql/{{ time }}/etherpad_lite_db.sql.gz
+
+    - name: Creating database and users for Etherpad
+      mysql_db:
+        login_user: root
+        login_password: root
+        state: import
+        name: all
+        target: ~/2018_Group_9/setting.sql
+    - name: Restore
+      shell: mysql -u root -proot etherpad_lite_db < /backup/mysql/{{ time }}/etherpad_lite_db.sql
+    
+    - name: Copy settings.json
+      copy: 
+        src: ~/2018_Group_9/settings.json
+        dest: ~/settings.json
+        force: yes
+   
+    - name: modify the json file
+      lineinfile:
+        dest: ~/settings.json
+        regexp: '^(.*)"host"  (.*)$' 
+        line: '                   "host"    : "{{ private_ip }}",'
+        backrefs: yes
+        
+    - name: Launch Multiple Web Servers
+      gce:
+        instance_names: webserver1,webserver2,webserver3
+        machine_type: "{{ machine_type }}"
+        image: "{{ image }}"
+        service_account_email: "{{ service_account_email }}"
+        zone: "australia-southeast1-b"
+        tags:
+          - http-server
+          - https-server
+        credentials_file: "{{ credentials_file }}"
+        project_id: "{{ project_id }}"
+      register: gce
+    
+    - name: Wait for SSH to come up
+      wait_for: host={{ item.public_ip }} port=22 delay=10 timeout=60
+      loop: "{{ gce.instance_data }}"
+
+    - name: Add host to groupname 
+      add_host: hostname={{ item.public_ip }} groupname=web_server
+      loop: "{{ gce.instance_data }}"
+  
+  
+- name: Build Web Servers
+  hosts: web_server
+  connection: ssh
+  gather_facts: no
+  become: yes
+  tasks: 
+    - name: Copy settings.json
+      copy: 
+        src: ~/2018_Group_9/settings.json
+        dest: ~/etherpad-lite/settings.json     
+    - name: Start Etherpad
+      shell: sh ~/2018_Group_9/demo.sh
+      async: 31536000
+      poll: 0
+    - name: Waiting for installation of Etheroad
+      wait_for: host=127.0.0.1 port=80 delay=10 timeout=600

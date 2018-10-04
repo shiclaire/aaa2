@@ -1,0 +1,286 @@
+- name: Build System Architecture
+  hosts: localhost
+  connection: local
+  gather_facts: no
+  
+  vars:
+    service_account_email: 
+    credentials_file: 
+    project_id: '{{project_id}}'
+    machine_type: n1-standard-1 
+    image: ubuntu-1604-xenial-v20180814
+    
+  tasks:
+    - name: Configure SSH
+      shell: |
+        echo "Host * ">> /etc/ssh/ssh_config
+        echo "  StrictHostKeyChecking no" >> /etc/ssh/ssh_config
+    
+    - name: Remove known hosts
+      file:
+        path: ~/.ssh/known_hosts
+        state: absent
+    
+    - name: Launch Management Server
+      gce:
+        instance_names: managementserver
+        machine_type: "{{ machine_type }}"
+        image: "{{ image }}"
+        service_account_email: "{{ service_account_email }}"
+        zone: "australia-southeast1-b"
+        tags:
+          - http-server
+          - https-server
+        credentials_file: "{{ credentials_file }}"
+        project_id: "{{ project_id }}"
+      register: gce 
+    
+    - name: Wait for SSH to come up
+      wait_for: host={{ item.public_ip }} port=22 delay=10 timeout=60
+      loop: "{{ gce.instance_data }}"
+
+    - name: Add host to groupname 
+      add_host: hostname={{ item.public_ip }} groupname=management_server
+      loop: "{{ gce.instance_data }}"
+      
+    - name: Store public ip address into task3_test.yml
+      lineinfile:
+        dest: ~/task3_test.yml
+        regexp: '    - management_ip_addr: 127.0.0.1' 
+        line: '    - ip: {{ item.public_ip }}'
+        backrefs: yes
+      loop: "{{ gce.instance_data }}"
+    
+    - name: Launch Database Server
+      gce:
+        instance_names: databaseserver
+        machine_type: "{{ machine_type }}"
+        image: "{{ image }}"
+        service_account_email: "{{ service_account_email }}"
+        zone: "australia-southeast1-b"
+        tags:
+          - http-server
+          - https-server
+        credentials_file: "{{ credentials_file }}"
+        project_id: "{{ project_id }}"
+      register: gce
+    
+    - name: Wait for SSH to come up
+      wait_for: host={{ item.public_ip }} port=22 delay=10 timeout=60
+      loop: "{{ gce.instance_data }}"
+
+    - name: Add host to groupname
+      add_host: hostname={{ item.public_ip }} groupname=database_server
+      loop: "{{ gce.instance_data }}"
+    
+    - name: Store private ip address into settings.json
+      lineinfile:
+        dest: ~/2018_Group_9/settings.json
+        regexp: '^(.*)"host"    : "localhost",(.*)$' 
+        line: '                   "host"    : "{{ item.private_ip }}",'
+        backrefs: yes
+      loop: "{{ gce.instance_data }}"
+
+    - name: Store private ip address
+      shell: echo "{{ item.private_ip }}" > /home/database_ip.txt
+      loop: "{{ gce.instance_data }}"
+
+    
+    - name: Launch Multiple Web Servers
+      gce:
+        instance_names: webserver1,webserver2,webserver3
+        machine_type: "{{ machine_type }}"
+        image: "{{ image }}"
+        service_account_email: "{{ service_account_email }}"
+        zone: "australia-southeast1-b"
+        tags:
+          - http-server
+          - https-server
+        credentials_file: "{{ credentials_file }}"
+        project_id: "{{ project_id }}"
+      register: gce
+    
+    - name: Wait for SSH to come up
+      wait_for: host={{ item.public_ip }} port=22 delay=10 timeout=60
+      loop: "{{ gce.instance_data }}"
+
+    - name: Add host to groupname 
+      add_host: hostname={{ item.public_ip }} groupname=web_server
+      loop: "{{ gce.instance_data }}"
+    
+    - name: Store IP addresses
+      lineinfile:
+          path: ~/2018_Group_9/task3_nginx.conf
+          insertafter: "upstream etherpads {"
+          line: "    server {{ item.public_ip }}:80;"
+          state: present
+      loop: "{{ gce.instance_data }}"
+
+- name: Build Management Server
+  hosts: management_server
+  connection: ssh
+  gather_facts: no
+  become: yes
+  
+  tasks:
+    - file:
+        path: "/root/log"
+        state: directory
+        
+    - name: Install Nginx
+      apt: name=nginx state=latest
+    
+    - name: Configure Nginx
+      copy:
+        src: ~/2018_Group_9/task3_nginx.conf
+        dest: /etc/nginx/sites-available/task3_nginx.conf
+        force: yes
+    
+    - name: Create symlink
+      file:
+        src: /etc/nginx/sites-available/task3_nginx.conf
+        dest: /etc/nginx/sites-enabled/default
+        state: link
+    
+    - name: Start Nginx service
+      service:
+          name: nginx
+          state: restarted
+      become: yes
+
+- name: Build Database Server
+  hosts: database_server
+  connection: ssh
+  gather_facts: no
+  become: yes
+  
+  tasks:
+    - name: Copy scripts
+      copy: 
+        src: ~/2018_Group_9/{{item}}
+        dest: ~/2018_Group_9/
+        mode: 0774
+      with_items:
+        ['switchmysql.sh','setting.sql']
+    
+    - name: Install Mysql Server
+      shell: sh ~/2018_Group_9/switchmysql.sh
+    
+    - name: Install Python Mysql Database
+      apt :
+        name: "{{item}}"
+        state: present
+        update_cache: yes
+      loop:
+        - python-mysqldb
+
+    - name: Configure Mysql Server
+      copy:
+        src: ~/2018_Group_9/mysqld.cnf
+        dest: /etc/mysql/mysql.conf.d/
+        force: yes
+    
+    - name: Start Mysql service
+      service:
+          name: mysql
+          state: restarted
+      become: yes
+      
+    - name: Create Databases, Create and Grant Users   
+      mysql_db:
+        login_user: root
+        login_password: root
+        state: import
+        name: all
+        target: ~/2018_Group_9/setting.sql
+    
+- name: Build Web Servers
+  hosts: web_server
+  connection: ssh
+  gather_facts: no
+  become: yes
+  
+  tasks:
+    - name: Remove old etherpad
+      file:
+        path: "{{ item }}"
+        state: absent
+      with_items:
+        - ~/etherpad-lite
+        - ~/2018_Group_9
+        
+    - name: Fetch Nodejs and Etherpad Package
+      shell: |
+        curl -sL https://deb.nodesource.com/setup_9.x |sudo -E bash 
+        git clone https://github.com/ether/etherpad-lite.git
+    
+    - name: Install Nodejs 
+      apt :
+        name: "{{item}}"
+        state: present
+        update_cache: yes
+      loop:
+        - nodejs
+        - python-mysqldb
+        - mysql-client
+
+    - name: Copy sript
+      copy: 
+        src: ~/2018_Group_9/demo.sh
+        dest: ~/2018_Group_9/
+        mode: 0774
+    
+    - name: Copy settings.json
+      copy: 
+        src: ~/2018_Group_9/settings.json
+        dest: ~/etherpad-lite/settings.json
+    
+    - name: Start Etherpad
+      shell: sh ~/2018_Group_9/demo.sh
+      async: 31536000
+      poll: 0
+     
+    - name: Waiting for installation of Etheroad
+      wait_for: host=127.0.0.1 port=80 delay=10 timeout=600
+
+- name: Automatic Database Backup
+  hosts: localhost
+  connection: local
+  gather_facts: no
+  become: yes
+
+  vars:
+    period: '{{period}}'
+    database_ip: "{{ lookup('file', '/home/database_ip.txt') }}"
+
+  tasks:
+    - name: Install Mysql Server
+      shell: sh ~/2018_Group_9/switchmysql.sh
+
+    - name: Install Python MySQL Database
+      apt:
+        name: python-mysqldb
+        state: present
+        update_cache: yes
+
+    - name: Start Mysql Service
+      service:
+        name: mysql
+        state: restarted
+
+    - name: Configure Backup script
+      lineinfile:
+        dest: ~/2018_Group_9/mysqlbackup.sh
+        regexp: '^(.*)DATABASE_IP=(.*)$'
+        line: 'DATABASE_IP={{ database_ip }}'
+        backrefs: yes
+    
+    - name: Create a cron job
+      lineinfile:
+        dest: /etc/crontab
+        line: '{{ period | default(*/1 * * * *) }} root /root/2018_Group_9/mysqlbackup.sh'
+
+    - name: Restart Cron Daemon
+      service:
+        name: cron
+        state: restarted
